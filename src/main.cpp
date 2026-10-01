@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <thread>
 #include "core.hpp"
+#include "activity-store.hpp"
 #include "content.hpp"
 
 #pragma comment(lib,"gdiplus.lib")
@@ -41,7 +43,8 @@ constexpr UINT TrayMessage=WM_APP+1, MarketMessage=WM_APP+2, OpenMessage=WM_APP+
 constexpr UINT_PTR DueTimer=1, MinuteTimer=2, ScreenTimer=3, RefreshTimer=4, CountdownTimer=5;
 enum Command { Restart=100, Snooze, Theme, Settings, NextThought, DollarChart, WonChart, Refresh,
     IntervalEdit=200, ApplyInterval, ThemeSystem, ThemeLight, ThemeDark, Startup, AllScreens, RestNow, HideSettings, TaskbarDisplay,
-    TrayOpen=300, TrayRest, TrayRestart, TrayPause, TrayQuit };
+    TrayOpen=300, TrayRest, TrayRestart, TrayPause, TrayQuit,
+    Dashboard=400, DayPrevious, DayNext, DayToday, EventsPrevious, EventsNext };
 enum class ThemeMode { System=0, Light=1, Dark=2 };
 struct Palette { Color background, text, muted, line, surface, accent, accentText; };
 Palette lightPalette() { return {Color(250,250,247),Color(30,34,31),Color(105,112,105),Color(224,227,220),Color(239,241,234),Color(206,234,157),Color(35,55,25)}; }
@@ -110,13 +113,21 @@ struct Options {
     bool background=false, preview=false, offline=false, test=false;
     int testSeconds=0;
     std::wstring diagnostic;
+    std::wstring history;
 };
 class App;
 App* instance=nullptr;
 LRESULT CALLBACK windowProc(HWND,UINT,WPARAM,LPARAM);
 class App {
     Options options;
-    HWND owner=nullptr, settings=nullptr, screen=nullptr, intervalEdit=nullptr;
+    HWND owner=nullptr, settings=nullptr, screen=nullptr, intervalEdit=nullptr, dashboard=nullptr;
+    ActivityStore activity;
+    std::vector<HWND> dashboardButtons;
+    std::int64_t lastObserved=0, lastSaved=0;
+    Tick lastObservedTick=0;
+    bool activityStarted=false, activityEnded=false;
+    int dayOffset=0;
+    size_t eventOffset=0;
     std::vector<HWND> shades;
     Schedule schedule;
     int minutes=50;
@@ -147,6 +158,33 @@ class App {
     std::wstring marketTitle, marketBody;
     std::wstring statusMessage;
     std::vector<HWND> mainButtons, settingButtons;
+    ActivityState activityState() const {
+        if(sleeping) return ActivityState::Sleeping;
+        if(locked) return ActivityState::Locked;
+        if(paused) return ActivityState::Paused;
+        return breaking?ActivityState::Resting:ActivityState::Running;
+    }
+    void observeActivity() {
+        if(!activityStarted||activityEnded) return;
+        const auto now=unixNow(); const auto tick=clockNow();
+        const auto wallElapsed=now-lastObserved;
+        const auto awakeElapsed=static_cast<std::int64_t>(tick-lastObservedTick);
+        if(lastObserved&&activityState()!=ActivityState::Sleeping&&(wallElapsed>45000||wallElapsed-awakeElapsed>2000)) {
+            activity.record(lastObserved,"unobserved",ActivityState::Unknown,minutes);
+            activity.record(now,"recovered",activityState(),minutes);
+        } else if(wallElapsed<0) activity.record(now,"clock_changed",activityState(),minutes);
+        lastObserved=now; lastObservedTick=tick;
+    }
+    void recordActivity(const char* kind) {
+        if(!activityStarted||activityEnded) return;
+        activity.record(unixNow(),kind,activityState(),minutes); lastSaved=unixNow();
+        lastObserved=lastSaved; lastObservedTick=clockNow();
+        if(dashboard) InvalidateRect(dashboard,nullptr,FALSE);
+    }
+    void endActivity(const char* kind) {
+        if(!activityStarted||activityEnded) return;
+        observeActivity(); activity.record(unixNow(),kind,ActivityState::Offline,minutes); activityEnded=true;
+    }
     Palette palette() const {
         bool dark=mode==ThemeMode::Dark;
         if(mode==ThemeMode::System) { DWORD value=1,size=sizeof(value); RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&value,&size); dark=value==0; }
@@ -196,10 +234,10 @@ class App {
         KillTimer(owner,DueTimer);
         if(!schedule.holding()) SetTimer(owner,DueTimer,static_cast<UINT>(std::clamp<Tick>(schedule.remaining(clockNow()),10,USER_TIMER_MAXIMUM)),nullptr);
     }
-    void restart(Tick length=0) {
+    void restart(Tick length=0,const char* reason="restart") {
         closeBreak(); paused=false;
         cycleLength=length?length:intervalLength(); schedule.restart(clockNow(),cycleLength);
-        holdState(); updateSettingsLabels(); repaint();
+        recordActivity(reason); holdState(); updateSettingsLabels(); repaint();
     }
     void updateTray(bool add=false) {
         NOTIFYICONDATAW data{}; data.cbSize=sizeof(data); data.hWnd=owner; data.uID=1;
@@ -215,6 +253,7 @@ class App {
         AppendMenuW(menu,MF_STRING|MF_DISABLED,0,time.c_str()); AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         AppendMenuW(menu,MF_STRING,TrayRest,L"지금 휴식하기"); AppendMenuW(menu,MF_STRING,TrayRestart,L"타이머 다시 시작");
         AppendMenuW(menu,MF_STRING,TrayPause,paused?L"알림 다시 켜기":L"알림 일시 정지");
+        AppendMenuW(menu,MF_STRING,Dashboard,L"사용 현황판");
         AppendMenuW(menu,MF_STRING,TrayOpen,L"설정 열기"); AppendMenuW(menu,MF_SEPARATOR,0,nullptr); AppendMenuW(menu,MF_STRING,TrayQuit,L"인터벌 종료");
         POINT point{}; GetCursorPos(&point); SetForegroundWindow(owner);
         UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,owner,nullptr);
@@ -364,6 +403,7 @@ class App {
         place(settingButtons[1],42,385,154,42,s); place(settingButtons[2],204,385,154,42,s); place(settingButtons[3],366,385,154,42,s);
         place(settingButtons[4],42,467,478,42,s); place(settingButtons[5],42,517,478,42,s);
         place(settingButtons[8],42,567,478,42,s);
+        place(settingButtons[9],366,95,154,42,s);
         place(settingButtons[6],42,657,234,48,s); place(settingButtons[7],288,657,232,48,s);
     }
     void updateSettingsLabels() {
@@ -376,6 +416,7 @@ class App {
         if(screen) { InvalidateRect(screen,nullptr,FALSE); for(auto b:mainButtons) InvalidateRect(b,nullptr,FALSE); }
         if(settings && IsWindowVisible(settings)) { InvalidateRect(settings,nullptr,FALSE); for(auto b:settingButtons) InvalidateRect(b,nullptr,FALSE); InvalidateRect(intervalEdit,nullptr,TRUE); }
         for(auto shade:shades) InvalidateRect(shade,nullptr,FALSE);
+        if(dashboard&&IsWindowVisible(dashboard)) InvalidateRect(dashboard,nullptr,FALSE);
     }
     void cycleTheme() { mode=mode==ThemeMode::Dark?ThemeMode::Light:ThemeMode::Dark; savePreferences(); updateTaskbar(true); repaint(); diagnostics(); }
     void pickRest() { size_t next=random()%rests.size(); if(next==restIndex) next=(next+1)%rests.size(); restIndex=next; }
@@ -417,7 +458,7 @@ class App {
         HWND shade=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"Interval.Shade",L"인터벌 · 휴식",WS_POPUP,r.left,r.top,r.right-r.left,r.bottom-r.top,self->screen,nullptr,GetModuleHandleW(nullptr),nullptr);
         self->shades.push_back(shade); ShowWindow(shade,SW_SHOWNOACTIVATE); return TRUE;
     }
-    void beginBreak() {
+    void beginBreak(bool automatic=false) {
         if(locked||sleeping) return;
         if(screen) { SetForegroundWindow(screen); return; }
         if(settings) ShowWindow(settings,SW_HIDE);
@@ -431,14 +472,17 @@ class App {
         mainButtons={button(screen,Restart,L"다시 시작  →"),button(screen,Snooze,L"5분 뒤 알림"),button(screen,Theme,L"테마 전환"),button(screen,Settings,L"설정"),button(screen,NextThought,L"다른 이야기  ↗"),button(screen,DollarChart,L"USDT"),button(screen,WonChart,L"KRW"),button(screen,Refresh,L"새로고침")};
         layoutScreen(); if(allMonitors) EnumDisplayMonitors(nullptr,nullptr,enumerateShade,reinterpret_cast<LPARAM>(this));
         ShowWindow(screen,SW_SHOW); SetForegroundWindow(screen); SetFocus(mainButtons[0]);
+        recordActivity(automatic?"break_auto":"break_manual");
         SetTimer(owner,ScreenTimer,1000,nullptr); SetTimer(owner,RefreshTimer,60000,nullptr);
         updateTaskbar(true); requestMarket(); diagnostics();
     }
     void closeBreak() {
+        const bool wasBreaking=breaking;
         KillTimer(owner,ScreenTimer); KillTimer(owner,RefreshTimer);
         if(network && !network->done) network->cancelled=true;
         for(auto shade:shades) DestroyWindow(shade); shades.clear();
         if(screen) { HWND old=screen; screen=nullptr; DestroyWindow(old); } screenTaskbarReady=false; mainButtons.clear(); breaking=false;
+        if(wasBreaking) recordActivity("break_end");
     }
     void createSettings() {
         if(!settings) {
@@ -451,7 +495,7 @@ class App {
             if(!settings) return;
             intervalEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",std::to_wstring(minutes).c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_NUMBER|ES_CENTER|ES_AUTOHSCROLL|ES_MULTILINE,0,0,0,0,settings,reinterpret_cast<HMENU>(IntervalEdit),GetModuleHandleW(nullptr),nullptr);
             SendMessageW(intervalEdit,EM_SETLIMITTEXT,3,0);
-            settingButtons={button(settings,ApplyInterval,L"간격 적용"),button(settings,ThemeSystem,L"시스템 설정"),button(settings,ThemeLight,L"라이트"),button(settings,ThemeDark,L"다크"),button(settings,Startup,L"Windows 시작 시 실행"),button(settings,AllScreens,L"모든 모니터에 휴식 알림"),button(settings,RestNow,L"지금 휴식하기  →"),button(settings,HideSettings,L"접고 계속 실행"),button(settings,TaskbarDisplay,L"작업표시줄 타이머")};
+            settingButtons={button(settings,ApplyInterval,L"간격 적용"),button(settings,ThemeSystem,L"시스템 설정"),button(settings,ThemeLight,L"라이트"),button(settings,ThemeDark,L"다크"),button(settings,Startup,L"Windows 시작 시 실행"),button(settings,AllScreens,L"모든 모니터에 휴식 알림"),button(settings,RestNow,L"지금 휴식하기  →"),button(settings,HideSettings,L"접고 계속 실행"),button(settings,TaskbarDisplay,L"작업표시줄 타이머"),button(settings,Dashboard,L"사용 현황판  ↗")};
             layoutSettings(); updateSettingsLabels();
         }
     }
@@ -459,6 +503,151 @@ class App {
         createSettings(); if(!settings) return;
         SetWindowPos(settings,screen?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         ShowWindow(settings,SW_RESTORE); SetForegroundWindow(settings); updateTaskbar(); repaint(); diagnostics();
+    }
+    static std::int64_t dayBoundary(int offset) {
+        const auto now=std::time(nullptr); std::tm day{}; localtime_s(&day,&now);
+        day.tm_hour=0; day.tm_min=0; day.tm_sec=0; day.tm_mday+=offset; day.tm_isdst=-1;
+        return static_cast<std::int64_t>(std::mktime(&day))*1000;
+    }
+    static std::wstring activityDuration(std::int64_t ms) {
+        if(ms<60000) return std::to_wstring(ms/1000)+L"초";
+        const auto m=ms/60000;
+        return m>=60?std::to_wstring(m/60)+L"시간 "+std::to_wstring(m%60)+L"분":std::to_wstring(m)+L"분";
+    }
+    static std::wstring activityName(ActivityState state) {
+        static const wchar_t* names[]={L"타이머 가동",L"휴식",L"일시 정지",L"화면 잠금",L"절전·대기",L"앱 미실행",L"확인 불가"};
+        return names[static_cast<size_t>(state)];
+    }
+    Color activityColor(ActivityState state) const {
+        const bool dark=palette().background.GetR()<100;
+        static const Color colors[]={Color(104,154,66),Color(68,158,181),Color(219,168,72),Color(150,121,187),Color(88,115,167),Color(138,146,141),Color(200,111,103)};
+        auto c=colors[static_cast<size_t>(state)];
+        return dark?Color(static_cast<BYTE>(std::min(255,static_cast<int>(c.GetR())+20)),static_cast<BYTE>(std::min(255,static_cast<int>(c.GetG())+20)),static_cast<BYTE>(std::min(255,static_cast<int>(c.GetB())+20))):c;
+    }
+    static std::wstring eventName(const std::string& kind) {
+        if(kind=="app_start") return L"앱 시작";
+        if(kind=="app_exit") return L"앱 종료";
+        if(kind=="shutdown") return L"Windows 종료·재시작";
+        if(kind=="logoff") return L"Windows 로그아웃";
+        if(kind=="session_end") return L"Windows 요청으로 앱 종료";
+        if(kind=="break_auto") return L"정해진 간격에 휴식 시작";
+        if(kind=="break_manual") return L"지금 휴식 시작";
+        if(kind=="break_end") return L"휴식 종료";
+        if(kind=="restart") return L"타이머 다시 시작";
+        if(kind=="snooze") return L"5분 뒤 알림";
+        if(kind=="pause") return L"알림 일시 정지";
+        if(kind=="resume") return L"알림 다시 켜기";
+        if(kind=="lock") return L"화면 잠금";
+        if(kind=="unlock") return L"잠금 해제";
+        if(kind=="suspend") return L"절전·대기 시작";
+        if(kind=="wake") return L"절전·대기에서 복귀";
+        if(kind=="interrupted") return L"종료 기록 없는 중단 · 마지막 저장 시점";
+        if(kind=="unobserved") return L"동작 확인이 끊긴 시점";
+        if(kind=="recovered") return L"동작 확인 재개";
+        if(kind=="clock_changed") return L"시스템 시각 변경";
+        if(kind=="damaged_record") return L"일부 기록을 읽을 수 없음";
+        if(kind=="interval_changed") return L"알림 간격 변경";
+        return L"상태 변경";
+    }
+    float dashboardScale(float& w,float& h) const {
+        RECT r{}; GetClientRect(dashboard,&r);
+        const auto scale=std::max(.1f,std::min({GetDpiForWindow(dashboard)/96.f,r.right/1000.f,r.bottom/900.f}));
+        w=r.right/scale; h=r.bottom/scale; return scale;
+    }
+    void layoutDashboard() {
+        if(!dashboard||dashboardButtons.empty()) return;
+        float w,h; const auto s=dashboardScale(w,h);
+        place(dashboardButtons[0],700,80,80,36,s); place(dashboardButtons[1],790,80,80,36,s); place(dashboardButtons[2],880,80,80,36,s);
+        place(dashboardButtons[3],780,670,85,30,s); place(dashboardButtons[4],875,670,85,30,s);
+    }
+    void showDashboard() {
+        if(!dashboard) {
+            const auto dpi=GetDpiForSystem(); MONITORINFO info{sizeof(info)};
+            GetMonitorInfoW(MonitorFromWindow(settings,MONITOR_DEFAULTTONEAREST),&info);
+            const auto s=std::min({dpi/96.f,(info.rcWork.right-info.rcWork.left-60)/1000.f,(info.rcWork.bottom-info.rcWork.top-60)/900.f});
+            RECT r{0,0,static_cast<LONG>(1000*s),static_cast<LONG>(900*s)};
+            AdjustWindowRectExForDpi(&r,WS_OVERLAPPEDWINDOW,FALSE,WS_EX_APPWINDOW,dpi);
+            dashboard=CreateWindowExW(WS_EX_APPWINDOW|WS_EX_CONTROLPARENT,L"Interval.Dashboard",L"인터벌 · 사용 현황판",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+                info.rcWork.left+(info.rcWork.right-info.rcWork.left-(r.right-r.left))/2,info.rcWork.top+(info.rcWork.bottom-info.rcWork.top-(r.bottom-r.top))/2,r.right-r.left,r.bottom-r.top,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            if(!dashboard) return;
+            dashboardButtons={button(dashboard,DayPrevious,L"이전 날"),button(dashboard,DayNext,L"다음 날"),button(dashboard,DayToday,L"오늘"),button(dashboard,EventsPrevious,L"최근 기록"),button(dashboard,EventsNext,L"이전 기록")};
+            layoutDashboard();
+        }
+        ShowWindow(dashboard,SW_RESTORE); SetForegroundWindow(dashboard); repaint(); diagnostics();
+    }
+    std::vector<const ActivityEvent*> dayEvents() const {
+        std::vector<const ActivityEvent*> result;
+        const auto begin=dayBoundary(dayOffset), end=dayBoundary(dayOffset+1);
+        const auto& events=activity.history.events();
+        auto it=std::lower_bound(events.begin(),events.end(),begin,[](const ActivityEvent& e,auto t){return e.time<t;});
+        for(;it!=events.end()&&it->time<end;++it) if(it->kind!="heartbeat") result.push_back(&*it);
+        std::reverse(result.begin(),result.end()); return result;
+    }
+    void drawDashboard(Graphics& g,float w,float) {
+        const auto p=palette(); const auto now=unixNow(), begin=dayBoundary(dayOffset), end=dayBoundary(dayOffset+1);
+        logo(g,40,28); text(g,L"사용 현황판",28,p.text,RectF(40,78,400,40),false,true);
+        auto time=static_cast<std::time_t>(begin/1000); std::tm day{}; localtime_s(&day,&time);
+        wchar_t label[64]{}; swprintf_s(label,L"%04d년 %02d월 %02d일",day.tm_year+1900,day.tm_mon+1,day.tm_mday);
+        text(g,std::wstring(label)+(dayOffset==0?L" · 오늘":L""),13,p.muted,RectF(40,122,600,27));
+        EnableWindow(dashboardButtons[1],dayOffset<0);
+        for(size_t i=0;i<ActivityStateCount;++i) {
+            const float x=40+static_cast<float>(i)*132;
+            SolidBrush dot(activityColor(static_cast<ActivityState>(i))); g.FillEllipse(&dot,x,169.f,9.f,9.f);
+            text(g,activityName(static_cast<ActivityState>(i)),11,p.muted,RectF(x+15,158,116,30));
+        }
+        const auto summary=activity.history.summarize(begin,end,now); const auto& ms=summary.milliseconds;
+        const std::array<std::int64_t,4> totals{ms[0],ms[1],ms[2]+ms[3]+ms[4],ms[5]+ms[6]};
+        const wchar_t* titles[]={L"타이머 가동",L"휴식",L"정지·잠금·절전",L"미실행·확인 불가"};
+        for(size_t i=0;i<4;++i) {
+            const float x=40+static_cast<float>(i)*234;
+            rounded(g,RectF(x,204,220,76),12,p.surface);
+            text(g,titles[i],11,p.muted,RectF(x+14,213,194,22));
+            text(g,activityDuration(totals[i]),22,p.text,RectF(x+14,238,194,34),false,true);
+        }
+        const auto active=ms[0]+ms[1];
+        const auto ratio=active?std::to_wstring(ms[1]*100/active)+L"%":L"—";
+        text(g,L"앱 시작 "+std::to_wstring(summary.starts)+L"회     휴식 "+std::to_wstring(summary.rests)+L"회     다시 시작 "+std::to_wstring(summary.restarts)+L"회     미루기 "+std::to_wstring(summary.snoozes)+L"회     휴식 비중 "+ratio,13,p.text,RectF(40,290,w-80,28));
+        text(g,L"하루의 흐름",15,p.text,RectF(40,325,500,28),false,true);
+        SolidBrush background(p.surface); g.FillRectangle(&background,40.f,361.f,920.f,27.f);
+        for(const auto& span:activity.history.spans(begin,end,now)) {
+            const float x=40+920*static_cast<float>(static_cast<double>(span.begin-begin)/(end-begin));
+            const float width=920*static_cast<float>(static_cast<double>(span.end-span.begin)/(end-begin));
+            SolidBrush ink(activityColor(span.state)); g.FillRectangle(&ink,x,361.f,width,27.f);
+        }
+        for(int i=0;i<=4;++i) text(g,std::to_wstring(i*6)+L"시",10,p.muted,RectF(40+i*230.f-(i==4?30.f:0),390,60,20));
+        text(g,L"최근 7일 · 상태별 누적 시간",15,p.text,RectF(40,425,600,28),false,true);
+        text(g,L"0시간",10,p.muted,RectF(160,447,80,18));
+        text(g,L"12시간",10,p.muted,RectF(455,447,80,18),true);
+        text(g,L"24시간",10,p.muted,RectF(770,447,70,18),true);
+        for(int i=0;i<7;++i) {
+            const auto a=dayBoundary(dayOffset-6+i), b=dayBoundary(dayOffset-5+i);
+            const auto sum=activity.history.summarize(a,b,now); const float y=466+i*26.f;
+            text(g,dateLabel(a),11,p.muted,RectF(40,y,100,22));
+            g.FillRectangle(&background,160.f,y+3,650.f,16.f); float x=160;
+            std::int64_t total=0;
+            for(size_t state=0;state<ActivityStateCount;++state) {
+                const auto amount=sum.milliseconds[state]; total+=amount;
+                const float width=650*static_cast<float>(static_cast<double>(amount)/(b-a));
+                SolidBrush ink(activityColor(static_cast<ActivityState>(state))); g.FillRectangle(&ink,x,y+3,width,16.f); x+=width;
+            }
+            text(g,activityDuration(total),10,p.muted,RectF(825,y,145,12));
+            text(g,L"휴식 "+std::to_wstring(sum.rests)+L" · 재시작 "+std::to_wstring(sum.restarts),9,p.muted,RectF(825,y+12,145,12));
+        }
+        auto events=dayEvents(); if(eventOffset>=events.size()) eventOffset=events.empty()?0:((events.size()-1)/5)*5;
+        text(g,L"이벤트 기록 · "+std::to_wstring(events.size())+L"건",15,p.text,RectF(40,670,550,28),false,true);
+        EnableWindow(dashboardButtons[3],eventOffset>0); EnableWindow(dashboardButtons[4],eventOffset+5<events.size());
+        for(size_t i=0;i<5&&eventOffset+i<events.size();++i) {
+            const auto& e=*events[eventOffset+i]; const float y=715+static_cast<float>(i)*24;
+            text(g,localTime(e.time),11,p.muted,RectF(40,y,80,22));
+            text(g,eventName(e.kind),12,p.text,RectF(125,y,610,22));
+            text(g,activityName(e.state)+L" · "+std::to_wstring(e.minutes)+L"분 간격",10,p.muted,RectF(745,y,220,22));
+        }
+        if(events.empty()) text(g,L"이 날에 기록된 이벤트가 없어요.",12,p.muted,RectF(40,717,900,30));
+        const auto note=activity.failed()?L"기록 저장 실패 · 폴더 접근 권한과 디스크 공간을 확인해주세요.":
+            activity.damaged()?L"일부 기록 손상 · 읽을 수 없는 구간은 확인 불가로 표시합니다.":
+            L"가동은 타이머 실행 시간입니다. 휴식 비중 = 휴식 / (가동 + 휴식). 빈 영역은 기록 전·미래입니다.";
+        text(g,note,10,activity.failed()?activityColor(ActivityState::Unknown):p.muted,RectF(40,850,w-80,24));
+        text(g,L"절전·잠금·미실행·확인 불가 시간은 가동과 휴식에서 제외합니다. 종료 기록 없는 중단은 마지막 저장부터 표시합니다.",10,p.muted,RectF(40,875,w-80,22));
     }
     std::wstring quoteLabel(const Quote& quote,bool won) {
         if(!quote.price) return options.offline?L"오프라인 · 가격을 가져오지 않았어요":network&&!network->done?L"거래소에 연결하고 있어요…":L"연결 실패 · 다음 갱신 때 다시 시도해요";
@@ -520,7 +709,7 @@ class App {
     }
     void drawSettings(Graphics& g,float w,float) {
         auto p=palette(); logo(g,42,33);
-        text(g,L"집중에 쉼표를.",30,p.text,RectF(42,94,w-84,49),false,true);
+        text(g,L"집중에 쉼표를.",30,p.text,RectF(42,94,315,49),false,true);
         text(g,L"정해진 시간이 되면 화면 전체로 쉬어갈 때를 알려드려요.",12,p.muted,RectF(42,152,w-84,28));
         rounded(g,RectF(42,195,w-84,53),12,p.surface);
         auto state=breaking?L"지금은 휴식 중이에요.":paused?L"알림이 일시 정지되어 있어요.":L"다음 휴식까지   "+duration(schedule.remaining(clockNow()));
@@ -543,6 +732,7 @@ class App {
         auto transform=[&](float scale) { Matrix matrix(scale,0,0,scale,-static_cast<float>(dirty.left),-static_cast<float>(dirty.top)); g.SetTransform(&matrix); };
         if(hwnd==screen) { s=screenScale(hwnd,w,h); transform(s); drawScreen(g,w,h); }
         else if(hwnd==settings) { s=settingsScale(w,h); transform(s); drawSettings(g,w,h); }
+        else if(hwnd==dashboard) { s=dashboardScale(w,h); transform(s); drawDashboard(g,w,h); }
         else { s=GetDpiForWindow(hwnd)/96.f; w=r.right/s; h=r.bottom/s; transform(s); text(g,L"잠깐 쉬어가세요.",32,palette().text,RectF(0,h/2-40,w,80),true,true); text(g,L"화면에서 눈을 떼고, 가볍게 몸을 움직여보세요.",14,palette().muted,RectF(0,h/2+47,w,35),true); text(g,L"ESC · 5분 뒤 알림",11,palette().muted,RectF(0,h-65,w,28),true); }
         Graphics target(dc); target.DrawImage(&buffer,dirty.left,dirty.top);
     }
@@ -553,6 +743,7 @@ class App {
         auto p=palette(); Graphics g(item.hDC); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         float s=GetDpiForWindow(item.hwndItem)/96.f,w=static_cast<float>(item.rcItem.right),h=static_cast<float>(item.rcItem.bottom);
         if(screen && GetParent(item.hwndItem)==screen) { float sw,sh; s=screenScale(screen,sw,sh); }
+        if(dashboard&&GetParent(item.hwndItem)==dashboard) { float dw,dh; s=dashboardScale(dw,dh); }
         g.ScaleTransform(s,s); w/=s; h/=s; g.Clear(p.background);
         int id=static_cast<int>(item.CtlID); bool primary=id==Restart||id==RestNow||id==ApplyInterval;
         bool selected=(id==ThemeSystem&&mode==ThemeMode::System)||(id==ThemeLight&&mode==ThemeMode::Light)||(id==ThemeDark&&mode==ThemeMode::Dark)||(id==DollarChart&&!wonSelected)||(id==WonChart&&wonSelected);
@@ -561,19 +752,27 @@ class App {
         if(item.itemState&ODS_SELECTED) background=p.line;
         if(!flat) rounded(g,RectF(0,0,w,h),std::min(10.f,h/2),background);
         wchar_t label[256]{}; GetWindowTextW(item.hwndItem,label,256);
-        text(g,label,id==Restart?15.f:id==Startup||id==AllScreens||id==TaskbarDisplay?12.f:11.f,primary||selected?p.accentText:p.text,RectF(8,0,w-16,h),true,primary||selected);
+        text(g,label,id==Restart?15.f:id==Startup||id==AllScreens||id==TaskbarDisplay?12.f:11.f,(item.itemState&ODS_DISABLED)?p.muted:primary||selected?p.accentText:p.text,RectF(8,0,w-16,h),true,primary||selected);
         if((item.itemState&ODS_FOCUS) && !(item.itemState&ODS_NOFOCUSRECT)) { Pen focus(p.muted,1.f); focus.SetDashStyle(DashStyleDot); g.DrawRectangle(&focus,3.f,3.f,w-6,h-6); }
     }
     void applyInterval() {
         wchar_t input[16]{}; GetWindowTextW(intervalEdit,input,16); wchar_t* end=nullptr; long n=wcstol(input,&end,10);
         if(!*input||*end||n<1||n>240) { statusMessage=L"알림 간격을 1–240분 사이로 입력해주세요."; repaint(); SetFocus(intervalEdit); return; }
         minutes=static_cast<int>(n); statusMessage=std::to_wstring(minutes)+L"분 간격을 적용했어요.";
+        recordActivity("interval_changed");
         savePreferences(); cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); armTimer(); updateTray(); updateTaskbar(); repaint(); diagnostics();
     }
     void execute(UINT command) {
+        observeActivity();
         switch(command) {
             case Restart: case TrayRestart: restart(); break;
-            case Snooze: restart(5*60000); break;
+            case Snooze: restart(5*60000,"snooze"); break;
+            case Dashboard: showDashboard(); break;
+            case DayPrevious: --dayOffset; eventOffset=0; repaint(); break;
+            case DayNext: dayOffset=std::min(0,dayOffset+1); eventOffset=0; repaint(); break;
+            case DayToday: dayOffset=0; eventOffset=0; repaint(); break;
+            case EventsPrevious: eventOffset=eventOffset>5?eventOffset-5:0; repaint(); break;
+            case EventsNext: if(eventOffset+5<dayEvents().size()) eventOffset+=5; repaint(); break;
             case Theme: cycleTheme(); break;
             case Settings: case TrayOpen: showSettings(); break;
             case TrayRest: case RestNow: beginBreak(); break;
@@ -587,17 +786,21 @@ class App {
             case AllScreens: allMonitors=!allMonitors; savePreferences(); updateSettingsLabels(); repaint(); diagnostics(); break;
             case HideSettings: dismissSettings(); break;
             case TaskbarDisplay: taskbarMode=static_cast<TaskbarMode>((static_cast<int>(taskbarMode)+1)%3); savePreferences(); updateSettingsLabels(); updateTaskbar(); repaint(); diagnostics(); break;
-            case TrayPause: if(breaking) restart(); paused=!paused; holdState(); repaint(); break;
+            case TrayPause: if(breaking) restart(); paused=!paused; recordActivity(paused?"pause":"resume"); holdState(); repaint(); break;
             case TrayQuit: DestroyWindow(owner); break;
         }
     }
     void diagnostics() {
         if(!options.test||options.diagnostic.empty()) return;
-        std::ofstream f(options.diagnostic,std::ios::trunc);
+        const auto temporary=options.diagnostic+L".tmp";
+        std::ofstream f(temporary,std::ios::trunc);
         if(!f) return;
         const auto state=indicator();
+        const auto summary=activity.history.summarize(dayBoundary(0),dayBoundary(1),unixNow());
         f<<"{\"pid\":"<<GetCurrentProcessId()<<",\"breaking\":"<<(breaking?"true":"false")<<",\"paused\":"<<(paused?"true":"false")<<",\"holding\":"<<(schedule.holding()?"true":"false")<<",\"remainingMs\":"<<schedule.remaining(clockNow())<<",\"intervalMinutes\":"<<minutes<<",\"theme\":"<<static_cast<int>(mode)<<",\"shades\":"<<shades.size()<<",\"dollar\":"<<market.dollar.price<<",\"won\":"<<market.won.price<<",\"dollarPoints\":"<<market.dollarChart.points.size()<<",\"wonPoints\":"<<market.wonChart.points.size()<<",\"fontFamilies\":"<<(fonts?fonts->GetFamilyCount():0)
-            <<",\"taskbarMode\":"<<static_cast<int>(taskbarMode)<<",\"taskbarVisible\":"<<(settings&&IsWindowVisible(settings)?"true":"false")<<",\"taskbarWarning\":"<<(state.warning?"true":"false")<<",\"taskbarMinutes\":"<<state.minutes<<",\"taskbarProgressApplied\":"<<(taskbarProgressApplied?"true":"false")<<"}";
+            <<",\"taskbarMode\":"<<static_cast<int>(taskbarMode)<<",\"taskbarVisible\":"<<(settings&&IsWindowVisible(settings)?"true":"false")<<",\"taskbarWarning\":"<<(state.warning?"true":"false")<<",\"taskbarMinutes\":"<<state.minutes<<",\"taskbarProgressApplied\":"<<(taskbarProgressApplied?"true":"false")
+            <<",\"activityEvents\":"<<activity.history.events().size()<<",\"activityState\":"<<static_cast<int>(activityState())<<",\"historyFailed\":"<<(activity.failed()?"true":"false")<<",\"runningMs\":"<<summary.milliseconds[0]<<",\"restingMs\":"<<summary.milliseconds[1]<<",\"sleepingMs\":"<<summary.milliseconds[4]<<",\"unknownMs\":"<<summary.milliseconds[6]<<",\"dashboardVisible\":"<<(dashboard&&IsWindowVisible(dashboard)?"true":"false")<<"}";
+        f.close(); MoveFileExW(temporary.c_str(),options.diagnostic.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
     }
 public:
     explicit App(Options opts):options(std::move(opts)) { instance=this; }
@@ -619,12 +822,20 @@ public:
         if(comInitialized&&SUCCEEDED(CoCreateInstance(CLSID_TaskbarList,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&taskbar)))) {
             if(FAILED(taskbar->HrInit())) { taskbar->Release(); taskbar=nullptr; }
         }
-        for(auto name:{L"Interval.Owner",L"Interval.Screen",L"Interval.Settings",L"Interval.Shade"}) {
+        for(auto name:{L"Interval.Owner",L"Interval.Screen",L"Interval.Settings",L"Interval.Shade",L"Interval.Dashboard"}) {
             WNDCLASSEXW cls{sizeof(cls)}; cls.lpfnWndProc=windowProc; cls.hInstance=GetModuleHandleW(nullptr); cls.hCursor=LoadCursorW(nullptr,IDC_ARROW); cls.hIcon=icon; cls.hIconSm=icon; cls.lpszClassName=name;
             if(!RegisterClassExW(&cls)) return false;
         }
         owner=CreateWindowExW(WS_EX_TOOLWINDOW,L"Interval.Owner",options.test?L"Interval.Background.Test":L"Interval.Background",WS_POPUP,0,0,0,0,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!owner) return false;
+        std::wstring historyPath=options.test?options.history:L"";
+        if(!options.test) {
+            const auto path=executable();
+            historyPath=path.substr(0,path.find_last_of(L"\\/"))+L"\\activity-v1.tsv";
+        }
+        activity.open(historyPath); activityStarted=true;
+        lastObserved=unixNow(); lastSaved=lastObserved; lastObservedTick=clockNow();
+        activity.start(lastObserved,activityState(),minutes);
         WTSRegisterSessionNotification(owner,NOTIFY_FOR_THIS_SESSION);
         cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); armTimer(); SetTimer(owner,MinuteTimer,60000,nullptr); SetTimer(owner,CountdownTimer,1000,nullptr); updateTray(true);
         createSettings(); updateTaskbar();
@@ -635,9 +846,9 @@ public:
         MSG msg{};
         while(GetMessageW(&msg,nullptr,0,0)>0) {
             const HWND active=GetAncestor(msg.hwnd,GA_ROOT);
-            if(msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE) { if(screen && (active==screen || std::find(shades.begin(),shades.end(),active)!=shades.end())) { restart(5*60000); continue; } if(active==settings) { dismissSettings(); continue; } }
+            if(msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE) { if(screen && (active==screen || std::find(shades.begin(),shades.end(),active)!=shades.end())) { observeActivity(); restart(5*60000,"snooze"); continue; } if(active==settings) { dismissSettings(); continue; } if(active==dashboard) { ShowWindow(dashboard,SW_HIDE); continue; } }
             if(msg.message==WM_KEYDOWN && msg.wParam==VK_RETURN && msg.hwnd==intervalEdit) { applyInterval(); continue; }
-            if((active==settings||active==screen) && IsDialogMessageW(active,&msg)) continue;
+            if((active==settings||active==screen||active==dashboard) && IsDialogMessageW(active,&msg)) continue;
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
         return static_cast<int>(msg.wParam);
@@ -651,7 +862,8 @@ public:
             case WM_ERASEBKGND: return 1;
             case WM_PAINT: if(hwnd!=owner) { paint(hwnd); return 0; } break;
             case WM_PRINTCLIENT: if(hwnd!=owner) { RECT r{}; GetClientRect(hwnd,&r); renderClient(hwnd,reinterpret_cast<HDC>(wParam),r); return 0; } break;
-            case WM_SIZE: if(hwnd==settings&&!settingButtons.empty()) layoutSettings(); if(hwnd==screen&&!mainButtons.empty()) layoutScreen(); return 0;
+            case WM_SIZE: if(hwnd==settings&&!settingButtons.empty()) layoutSettings(); if(hwnd==screen&&!mainButtons.empty()) layoutScreen(); if(hwnd==dashboard) layoutDashboard(); return 0;
+            case WM_MOUSEWHEEL: if(hwnd==dashboard) { execute(GET_WHEEL_DELTA_WPARAM(wParam)>0?EventsPrevious:EventsNext); return 0; } break;
             case WM_DPICHANGED: { auto r=reinterpret_cast<RECT*>(lParam); SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE); repaint(); return 0; }
             case WM_SETTINGCHANGE: updateTaskbar(true); repaint(); return 0;
             case WM_DISPLAYCHANGE: if(breaking) { closeBreak(); breaking=false; beginBreak(); } return 0;
@@ -659,11 +871,12 @@ public:
                 static HBRUSH brush=nullptr; if(brush) DeleteObject(brush); auto p=palette(); brush=CreateSolidBrush(RGB(p.surface.GetR(),p.surface.GetG(),p.surface.GetB()));
                 SetTextColor(reinterpret_cast<HDC>(wParam),RGB(p.text.GetR(),p.text.GetG(),p.text.GetB())); SetBkColor(reinterpret_cast<HDC>(wParam),RGB(p.surface.GetR(),p.surface.GetG(),p.surface.GetB())); return reinterpret_cast<LRESULT>(brush);
             }
-            case WM_CLOSE: if(hwnd==settings) dismissSettings(); else if(hwnd==screen) restart(); else if(hwnd!=owner) restart(5*60000); return 0;
+            case WM_CLOSE: observeActivity(); if(hwnd==settings) dismissSettings(); else if(hwnd==dashboard) ShowWindow(dashboard,SW_HIDE); else if(hwnd==screen) restart(); else if(hwnd!=owner) restart(5*60000,"snooze"); return 0;
             case WM_TIMER:
-                if(wParam==DueTimer) { KillTimer(owner,DueTimer); if(schedule.due(clockNow())) beginBreak(); else armTimer(); }
+                observeActivity();
+                if(wParam==DueTimer) { KillTimer(owner,DueTimer); if(schedule.due(clockNow())) beginBreak(true); else armTimer(); }
                 else if(wParam==MinuteTimer) { updateTray(); if(settings&&IsWindowVisible(settings)) InvalidateRect(settings,nullptr,FALSE); }
-                else if(wParam==CountdownTimer) { updateTaskbar(); if(settings&&IsWindowVisible(settings)&&!IsIconic(settings)) InvalidateRect(settings,nullptr,FALSE); diagnostics(); }
+                else if(wParam==CountdownTimer) { if(unixNow()-lastSaved>=15000) recordActivity("heartbeat"); updateTaskbar(); if(settings&&IsWindowVisible(settings)&&!IsIconic(settings)) InvalidateRect(settings,nullptr,FALSE); if(dashboard&&IsWindowVisible(dashboard)&&!IsIconic(dashboard)) InvalidateRect(dashboard,nullptr,FALSE); diagnostics(); }
                 else if(wParam==ScreenTimer && screen) { float w,h; auto s=screenScale(screen,w,h); auto x=(w-780)/2,y=(h-770)/2; RECT r{static_cast<LONG>((x+280)*s),static_cast<LONG>((y+650)*s),static_cast<LONG>((x+500)*s),static_cast<LONG>((y+675)*s)}; InvalidateRect(screen,&r,FALSE); }
                 else if(wParam==RefreshTimer) requestMarket();
                 return 0;
@@ -675,13 +888,21 @@ public:
                 return 0;
             case OpenMessage: if(wParam==1) beginBreak(); else showSettings(); return 0;
             case WM_WTSSESSION_CHANGE:
-                if(wParam==WTS_SESSION_LOCK) { locked=true; if(breaking) { closeBreak(); cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); } holdState(); }
-                if(wParam==WTS_SESSION_UNLOCK) { locked=false; holdState(); } return 0;
+                if(hwnd!=owner) break;
+                observeActivity();
+                if(wParam==WTS_SESSION_LOCK&&!locked) { locked=true; if(breaking) { closeBreak(); cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); } recordActivity("lock"); holdState(); }
+                if(wParam==WTS_SESSION_UNLOCK&&locked) { locked=false; recordActivity("unlock"); holdState(); } return 0;
             case WM_POWERBROADCAST:
-                if(wParam==PBT_APMSUSPEND) { sleeping=true; if(breaking) { closeBreak(); cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); } holdState(); }
-                if(wParam==PBT_APMRESUMEAUTOMATIC||wParam==PBT_APMRESUMESUSPEND) { sleeping=false; holdState(); } return TRUE;
+                if(hwnd!=owner) return TRUE;
+                observeActivity();
+                if(wParam==PBT_APMSUSPEND&&!sleeping) { sleeping=true; if(breaking) { closeBreak(); cycleLength=intervalLength(); schedule.restart(clockNow(),cycleLength); } recordActivity("suspend"); holdState(); }
+                if((wParam==PBT_APMRESUMEAUTOMATIC||wParam==PBT_APMRESUMESUSPEND||wParam==PBT_APMRESUMECRITICAL)&&sleeping) { sleeping=false; recordActivity("wake"); holdState(); } return TRUE;
+            case WM_QUERYENDSESSION: if(hwnd==owner) { observeActivity(); recordActivity("heartbeat"); } return TRUE;
+            case WM_ENDSESSION:
+                if(hwnd==owner&&wParam) { endActivity((lParam&ENDSESSION_LOGOFF)?"logoff":(lParam&ENDSESSION_CLOSEAPP)?"session_end":"shutdown"); DestroyWindow(owner); }
+                return 0;
             case WM_DESTROY:
-                if(hwnd==owner) { closeBreak(); if(settings) { auto old=settings; settings=nullptr; DestroyWindow(old); } NOTIFYICONDATAW data{}; data.cbSize=sizeof(data); data.hWnd=owner; data.uID=1; Shell_NotifyIconW(NIM_DELETE,&data); WTSUnRegisterSessionNotification(owner); if(network) network->cancelled=true; PostQuitMessage(0); } return 0;
+                if(hwnd==owner) { closeBreak(); endActivity("app_exit"); if(dashboard) { auto old=dashboard; dashboard=nullptr; DestroyWindow(old); } if(settings) { auto old=settings; settings=nullptr; DestroyWindow(old); } NOTIFYICONDATAW data{}; data.cbSize=sizeof(data); data.hWnd=owner; data.uID=1; Shell_NotifyIconW(NIM_DELETE,&data); WTSUnRegisterSessionNotification(owner); if(network) network->cancelled=true; PostQuitMessage(0); } return 0;
         }
         return DefWindowProcW(hwnd,message,wParam,lParam);
     }
@@ -697,6 +918,7 @@ Options parseOptions() {
         else if(arg==L"--test-mode") options.test=true;
         else if(arg==L"--test-seconds"&&i+1<argc) options.testSeconds=std::clamp(_wtoi(argv[++i]),1,86400);
         else if(arg==L"--diagnostics"&&i+1<argc) options.diagnostic=argv[++i];
+        else if(arg==L"--history"&&i+1<argc) options.history=argv[++i];
     }
     LocalFree(argv); return options;
 }

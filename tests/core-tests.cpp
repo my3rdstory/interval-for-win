@@ -1,4 +1,5 @@
 #include "../src/core.hpp"
+#include "../src/activity.hpp"
 #include <iostream>
 #include <stdexcept>
 using namespace interval;
@@ -7,6 +8,47 @@ void check(bool condition,const char* name) { ++checks; if(!condition) throw std
 template<class F> void rejects(F fn,const char* name) { bool failed=false; try { fn(); } catch(const std::exception&) { failed=true; } check(failed,name); }
 int main() {
     try {
+        ActivityHistory activity;
+        constexpr std::int64_t base=1790870400000;
+        activity.append(base,"app_start",ActivityState::Running,50);
+        activity.append(base+60000,"break_auto",ActivityState::Resting,50);
+        activity.append(base+120000,"suspend",ActivityState::Sleeping,50);
+        activity.append(base+3600000,"wake",ActivityState::Running,50);
+        activity.append(base+3660000,"restart",ActivityState::Running,50);
+        activity.append(base+3720000,"app_exit",ActivityState::Offline,50);
+        activity.append(base+7200000,"app_start",ActivityState::Running,50);
+        auto total=activity.summarize(base,base+7260000,base+7260000);
+        check(total.milliseconds[0]==240000&&total.milliseconds[1]==60000,"activity separates running and resting");
+        check(total.milliseconds[4]==3480000&&total.milliseconds[5]==3480000,"sleep and app downtime excluded from active time");
+        check(total.starts==2&&total.rests==1&&total.restarts==1,"activity counts starts rests and restarts");
+        auto clipped=activity.summarize(base+90000,base+150000,base+7260000);
+        check(clipped.milliseconds[1]==30000&&clipped.milliseconds[4]==30000,"cross-boundary intervals are clipped without double counting");
+        check(activity.spans(base-3600000,base,base+7260000).empty(),"no fabricated activity before first recording");
+        check(activity.summarize(base+7200000,base+9000000,base+7260000).milliseconds[0]==60000,"future time excluded from live summary");
+        ActivityEvent restored;
+        check(decodeActivity(encodeActivity(activity.events().front()),restored)&&restored.time==base,"activity log round trip");
+        check(!decodeActivity("1\t1790870400000\tapp_start\t99\t50",restored)&&!decodeActivity("1\t1790870400000\tapp_sta",restored),"invalid or torn activity record rejected");
+        check(!activity.restore({base,"app_start",ActivityState::Running,50}),"out of order stored activity rejected");
+        ActivityHistory midnight;
+        midnight.append(base-60000,"app_start",ActivityState::Running,50);
+        midnight.append(base+60000,"pause",ActivityState::Paused,50);
+        midnight.append(base+120000,"lock",ActivityState::Locked,50);
+        midnight.append(base+180000,"suspend",ActivityState::Sleeping,50);
+        midnight.append(base+240000,"wake",ActivityState::Locked,50);
+        midnight.append(base+300000,"unlock",ActivityState::Paused,50);
+        midnight.append(base+360000,"resume",ActivityState::Running,50);
+        auto nested=midnight.summarize(base,base+420000,base+420000);
+        check(nested.milliseconds[0]==120000&&nested.milliseconds[2]==120000&&nested.milliseconds[3]==120000&&nested.milliseconds[4]==60000,"midnight and overlapping holds keep exclusive time buckets");
+        ActivityHistory crash;
+        crash.append(base,"app_start",ActivityState::Running,50);
+        crash.append(base+15000,"heartbeat",ActivityState::Running,50);
+        crash.append(base+30000,"heartbeat",ActivityState::Running,50);
+        check(crash.events().size()==2,"consecutive checkpoints compact in memory");
+        crash.append(base+30000,"interrupted",ActivityState::Unknown,50);
+        crash.append(base+600000,"app_start",ActivityState::Running,50);
+        check(crash.summarize(base,base+600000,base+600000).milliseconds[6]==570000,"crash recovery never credits unobserved gap to running");
+        crash.append(base+599000,"clock_changed",ActivityState::Running,50);
+        check(crash.events().back().time==base+600000,"clock rollback cannot create negative durations");
         Schedule timer;
         timer.restart(100,50*60000);
         check(timer.remaining(100)==3000000,"default 50 minutes");
@@ -62,7 +104,7 @@ int main() {
         rejects([&](){parseSeries(Provider::Binance,R"([[1790870400000,"1","1","1","120"]])",now);},"one point cannot masquerade as a chart");
         refreshSeries(series,Provider::Binance,Provider::Okx,fail,now+60000);
         check(!series.fresh&&series.points.size()==2,"offline preserves chart with stale state");
-        std::cout<<"PASS: "<<checks<<" meaningful checks (schedule, JSON, feed parsing, priority, fallback, stale data).\n";
+        std::cout<<"PASS: "<<checks<<" meaningful checks (activity, schedule, JSON, feed parsing, priority, fallback, stale data).\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<"FAIL: "<<e.what()<<"\n"; return 1; }
 }

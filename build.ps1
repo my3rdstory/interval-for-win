@@ -28,12 +28,13 @@ try {
     }
     Copy-Item -LiteralPath '../assets/SB_Aggro_Font_license.pdf' -Destination '../dist/SB_Aggro_Font_license.pdf' -Force
     Copy-Item -LiteralPath '../assets/interval.svg' -Destination '../dist/interval.svg' -Force
+    Copy-Item -LiteralPath '../start.ps1' -Destination '../dist/start.ps1' -Force
     $releaseReadme = (Get-Content -LiteralPath '../README.md' -Raw -Encoding UTF8).Replace('(docs/screenshots/', '(https://raw.githubusercontent.com/my3rdstory/interval-for-win/main/docs/screenshots/').Replace('(assets/SB_Aggro_Font_license.pdf)', '(SB_Aggro_Font_license.pdf)').Replace('(assets/licenses/MSVC-STL-LICENSE.txt)', '(MSVC-STL-LICENSE.txt)').Replace('(assets/interval.svg)', '(interval.svg)')
     Set-Content -LiteralPath '../dist/README.md' -Value $releaseReadme -Encoding UTF8
     Copy-Item -LiteralPath '../LICENSE' -Destination '../dist/LICENSE' -Force
     Copy-Item -LiteralPath '../assets/licenses/MSVC-STL-LICENSE.txt' -Destination '../dist/MSVC-STL-LICENSE.txt' -Force
     $releaseNotices = (Get-Content -LiteralPath '../THIRD-PARTY-NOTICES.md' -Raw -Encoding UTF8).Replace('(assets/licenses/MSVC-STL-LICENSE.txt)', '(MSVC-STL-LICENSE.txt)')
     Set-Content -LiteralPath '../dist/THIRD-PARTY-NOTICES.md' -Value $releaseNotices -Encoding UTF8
-    Compress-Archive -LiteralPath '../dist/Interval.exe','../dist/interval.svg','../dist/LICENSE','../dist/SB_Aggro_Font_license.pdf','../dist/MSVC-STL-LICENSE.txt','../dist/THIRD-PARTY-NOTICES.md','../dist/README.md' -DestinationPath '../dist/Interval-1.0.0-win-x64.zip' -Force
+    Compress-Archive -LiteralPath '../dist/Interval.exe','../dist/start.ps1','../dist/interval.svg','../dist/LICENSE','../dist/SB_Aggro_Font_license.pdf','../dist/MSVC-STL-LICENSE.txt','../dist/THIRD-PARTY-NOTICES.md','../dist/README.md' -DestinationPath '../dist/Interval-1.0.0-win-x64.zip' -Force
     Get-Item '../dist/Interval.exe' | Select-Object FullName,Length
 } finally { Pop-Location }

@@ -1,7 +1,7 @@
-﻿param([switch]$Live)
+﻿param([switch]$Live,[string]$Executable)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
-$exe = Join-Path $projectRoot 'dist\Interval.exe'
+$exe = if ($Executable) { $Executable } else { Join-Path $projectRoot 'dist\Interval.exe' }
 $artifactDir = Join-Path $projectRoot 'build\qa'
 New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
 Add-Type -AssemblyName System.Drawing
@@ -65,7 +65,7 @@ if ($existing -ne [IntPtr]::Zero) { throw 'Close the existing Interval test inst
 $statusPath = Join-Path $artifactDir 'status.json'
 $arguments = '--test-mode --background --test-seconds 2 --diagnostics "'+$statusPath+'"'
 if (!$Live) { $arguments += ' --offline' }
-$process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru
+$process = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Hidden
 function State { try { $s=Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json; if ($s.pid -eq $process.Id) { $s } else { $null } } catch { $null } }
 try {
     Wait-For { $script:owner=[IntervalQA]::FindWindow('Interval.Owner','Interval.Background.Test'); $owner -ne [IntPtr]::Zero }
@@ -106,7 +106,7 @@ try {
     Assert (!(State).breaking) 'Paused app does not open a break at the old deadline.'
     [IntervalQA]::Click($settings,203); Capture $settings 'settings-light.png'
     [IntervalQA]::Click($settings,204); Capture $settings 'settings-dark.png'
-    $duplicate=Start-Process -FilePath $exe -ArgumentList '--test-mode --background' -PassThru
+    $duplicate=Start-Process -FilePath $exe -ArgumentList '--test-mode --background' -PassThru -WindowStyle Hidden
     Assert ($duplicate.WaitForExit(4000)) 'Duplicate launch reuses the existing app.'
     [IntervalQA]::Click($settings,208)
     $process.Refresh()

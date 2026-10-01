@@ -1,4 +1,4 @@
-﻿param()
+﻿param([string]$Executable)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $artifactDir = Join-Path $projectRoot 'build\qa'
@@ -47,7 +47,7 @@ function Capture-Icon([IntPtr]$Window,[string]$Name) {
 }
 if ([IntervalTaskbarQA]::FindWindow('Interval.Owner','Interval.Background.Test') -ne [IntPtr]::Zero) { throw 'Close the existing test instance first.' }
 $statusPath=Join-Path $artifactDir 'taskbar-status.json'
-$exe=Join-Path $projectRoot 'dist\Interval.exe'
+$exe=if ($Executable) { $Executable } else { Join-Path $projectRoot 'dist\Interval.exe' }
 $arguments='--test-mode --background --offline --test-seconds 310 --diagnostics "'+$statusPath+'"'
 $process=Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -WindowStyle Hidden
 function State {
