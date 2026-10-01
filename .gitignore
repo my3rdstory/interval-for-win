@@ -1,0 +1,7 @@
+/build/
+/dist/
+/assets/aggro-original.zip
+/assets/*.ttf
+/assets/*.otf
+*.user
+*.suo
