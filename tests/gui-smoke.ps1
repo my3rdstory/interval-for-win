@@ -24,6 +24,15 @@ public static class IntervalQA {
  [DllImport("user32.dll",CharSet=CharSet.Unicode,EntryPoint="SendMessageW")] public static extern IntPtr GetTextMessage(IntPtr h,uint m,IntPtr w,StringBuilder text);
  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out RECT rect);
  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
+ public delegate bool WindowCallback(IntPtr hwnd,IntPtr data);
+ [DllImport("user32.dll")] public static extern bool EnumWindows(WindowCallback callback,IntPtr data);
+ [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint pid);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd,StringBuilder name,int count);
+ public static IntPtr ProcessWindow(int processId,string cls) {
+  IntPtr found=IntPtr.Zero;
+  EnumWindows((h,d)=>{ uint pid; GetWindowThreadProcessId(h,out pid); var name=new StringBuilder(128); GetClassName(h,name,name.Capacity); if(pid==processId&&name.ToString()==cls){found=h;return false;}return true; },IntPtr.Zero);
+  return found;
+ }
  [DllImport("gdi32.dll",CharSet=CharSet.Unicode)] public static extern int GetObject(IntPtr h,int count,out LOGFONT font);
  public static LOGFONT Font(IntPtr hwnd) {
   var handle=SendMessage(hwnd,0x31,IntPtr.Zero,IntPtr.Zero);
@@ -70,16 +79,16 @@ try {
     Assert ((State).theme -eq 2) 'Break screen switches to dark mode.'
     Capture $screen 'break-dark.png'
     [IntervalQA]::Click($screen,100)
-    Assert (!(State).breaking -and (State).remainingMs -ge 1900) 'Restart begins a fresh full interval.'
+    Assert (!(State).breaking -and (State).remainingMs -ge 1500) 'Restart begins a fresh full interval (allowing native window animation time).'
     Start-Sleep -Milliseconds 400
     Assert (!(State).breaking) 'Break does not reappear prematurely.'
     Wait-For { (State).breaking } 5000
     Assert ((State).breaking) 'Restarted schedule produces its next break.'
     Wait-For { $script:screen=[IntervalQA]::FindWindow('Interval.Screen','인터벌 · 잠시 쉬어가세요'); $screen -ne [IntPtr]::Zero -and [IntervalQA]::GetDlgItem($screen,101) -ne [IntPtr]::Zero }
     [IntervalQA]::Click($screen,101)
-    Assert (!(State).breaking -and (State).remainingMs -ge 299900) 'Snooze schedules five minutes.'
+    Assert (!(State).breaking -and (State).remainingMs -ge 299500) 'Snooze schedules five minutes (allowing native window animation time).'
     [void][IntervalQA]::SendMessage($owner,32771,[IntPtr]::Zero,[IntPtr]::Zero)
-    $settings=[IntervalQA]::FindWindow('Interval.Settings','인터벌 · 설정')
+    $settings=[IntervalQA]::ProcessWindow($process.Id,'Interval.Settings')
     Assert ($settings -ne [IntPtr]::Zero) 'Settings opens from the resident app.'
     $edit=[IntervalQA]::GetDlgItem($settings,200)
     $font=[IntervalQA]::Font($edit)

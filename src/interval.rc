@@ -1,4 +1,6 @@
+#pragma code_page(65001)
 #include <windows.h>
+1 ICON "../build/interval.ico"
 101 RCDATA "../assets/SB_Aggro_L.ttf"
 102 RCDATA "../assets/SB_Aggro_M.ttf"
 1 RT_MANIFEST "interval.manifest"
@@ -14,11 +16,11 @@ BEGIN
   BLOCK "040904b0"
   BEGIN
    VALUE "CompanyName", "Interval"
-   VALUE "FileDescription", "Interval - a pause for your day"
+   VALUE "FileDescription", "인터벌 · 휴식 알림"
    VALUE "FileVersion", "1.0.0"
    VALUE "InternalName", "Interval"
    VALUE "OriginalFilename", "Interval.exe"
-   VALUE "ProductName", "Interval"
+   VALUE "ProductName", "인터벌 (Interval)"
    VALUE "ProductVersion", "1.0.0"
   END
  END

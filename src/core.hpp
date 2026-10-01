@@ -8,6 +8,13 @@
 
 namespace interval {
 using Tick = std::uint64_t;
+enum class TaskbarMode { Always=0, LastFiveMinutes=1, Hidden=2 };
+struct CountdownIndicator { unsigned minutes; bool warning, visible; };
+inline CountdownIndicator countdownIndicator(Tick remaining,bool holding,bool breaking,TaskbarMode mode) {
+    const bool warning=!holding&&!breaking&&remaining>0&&remaining<=5*60000;
+    return {static_cast<unsigned>((remaining+59999)/60000),warning,
+        mode==TaskbarMode::Always||(mode==TaskbarMode::LastFiveMinutes&&warning)};
+}
 // The platform clock excludes sleep; explicit holds additionally exclude locked sessions.
 class Schedule {
     Tick due_ = 0, held_ = 0;

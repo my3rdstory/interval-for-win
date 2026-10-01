@@ -16,6 +16,18 @@ int main() {
         timer.hold(9900010); timer.restart(9900010,3000000); timer.resume(15000000);
         check(timer.remaining(15000000)==3000000,"restart from a break counts a fresh full interval");
         timer.restart(15000000,300000); check(timer.due(15300000),"five minute snooze");
+        auto countdown=countdownIndicator(3000000,false,false,TaskbarMode::Always);
+        check(countdown.minutes==50&&countdown.visible&&!countdown.warning,"taskbar shows default 50 minutes");
+        countdown=countdownIndicator(300001,false,false,TaskbarMode::LastFiveMinutes);
+        check(countdown.minutes==6&&!countdown.visible&&!countdown.warning,"no early five-minute warning");
+        countdown=countdownIndicator(300000,false,false,TaskbarMode::LastFiveMinutes);
+        check(countdown.minutes==5&&countdown.visible&&countdown.warning,"five-minute boundary enables taskbar");
+        check(countdownIndicator(1,false,false,TaskbarMode::Always).minutes==1,"remaining minutes round up");
+        check(!countdownIndicator(0,false,false,TaskbarMode::LastFiveMinutes).visible,"deadline is not a pre-break warning");
+        check(!countdownIndicator(240000,true,false,TaskbarMode::LastFiveMinutes).warning,"held schedule does not warn");
+        check(!countdownIndicator(240000,false,true,TaskbarMode::LastFiveMinutes).visible,"break is not counted as upcoming");
+        check(!countdownIndicator(240000,false,false,TaskbarMode::Hidden).visible,"disabled taskbar remains hidden");
+        check(countdownIndicator(240*60000,false,false,TaskbarMode::Always).minutes==240,"three-digit maximum interval");
         check(parseJson("{\"x\":[1,true,null,\"\\uD83D\\uDE00\"]}").at("x").at(3).string.size()==4,"Unicode surrogate pair");
         for(const auto* bad:{"[1,]","{\"a\":1,}","01","1e","\"\\uD800\"","{\"x\":1,\"x\":2}","true false","1e999"}) rejects([&](){parseJson(bad);},"malformed JSON rejected");
         rejects([](){parseJson(std::string(40,'[')+"0"+std::string(40,']'));},"depth bounded");

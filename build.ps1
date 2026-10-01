@@ -2,6 +2,7 @@ param([switch]$SkipTests)
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 & (Join-Path $projectRoot 'fetch-fonts.ps1')
+& (Join-Path $projectRoot 'build-icon.ps1')
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (!(Test-Path -LiteralPath $vswhere)) { throw 'Install Visual Studio Build Tools with Desktop development with C++.' }
 $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -26,12 +27,13 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Core verification failed.' }
     }
     Copy-Item -LiteralPath '../assets/SB_Aggro_Font_license.pdf' -Destination '../dist/SB_Aggro_Font_license.pdf' -Force
-    $releaseReadme = (Get-Content -LiteralPath '../README.md' -Raw -Encoding UTF8).Replace('(docs/screenshots/', '(https://raw.githubusercontent.com/my3rdstory/interval-for-win/main/docs/screenshots/').Replace('(assets/SB_Aggro_Font_license.pdf)', '(SB_Aggro_Font_license.pdf)').Replace('(assets/licenses/MSVC-STL-LICENSE.txt)', '(MSVC-STL-LICENSE.txt)')
+    Copy-Item -LiteralPath '../assets/interval.svg' -Destination '../dist/interval.svg' -Force
+    $releaseReadme = (Get-Content -LiteralPath '../README.md' -Raw -Encoding UTF8).Replace('(docs/screenshots/', '(https://raw.githubusercontent.com/my3rdstory/interval-for-win/main/docs/screenshots/').Replace('(assets/SB_Aggro_Font_license.pdf)', '(SB_Aggro_Font_license.pdf)').Replace('(assets/licenses/MSVC-STL-LICENSE.txt)', '(MSVC-STL-LICENSE.txt)').Replace('(assets/interval.svg)', '(interval.svg)')
     Set-Content -LiteralPath '../dist/README.md' -Value $releaseReadme -Encoding UTF8
     Copy-Item -LiteralPath '../LICENSE' -Destination '../dist/LICENSE' -Force
     Copy-Item -LiteralPath '../assets/licenses/MSVC-STL-LICENSE.txt' -Destination '../dist/MSVC-STL-LICENSE.txt' -Force
     $releaseNotices = (Get-Content -LiteralPath '../THIRD-PARTY-NOTICES.md' -Raw -Encoding UTF8).Replace('(assets/licenses/MSVC-STL-LICENSE.txt)', '(MSVC-STL-LICENSE.txt)')
     Set-Content -LiteralPath '../dist/THIRD-PARTY-NOTICES.md' -Value $releaseNotices -Encoding UTF8
-    Compress-Archive -LiteralPath '../dist/Interval.exe','../dist/LICENSE','../dist/SB_Aggro_Font_license.pdf','../dist/MSVC-STL-LICENSE.txt','../dist/THIRD-PARTY-NOTICES.md','../dist/README.md' -DestinationPath '../dist/Interval-1.0.0-win-x64.zip' -Force
+    Compress-Archive -LiteralPath '../dist/Interval.exe','../dist/interval.svg','../dist/LICENSE','../dist/SB_Aggro_Font_license.pdf','../dist/MSVC-STL-LICENSE.txt','../dist/THIRD-PARTY-NOTICES.md','../dist/README.md' -DestinationPath '../dist/Interval-1.0.0-win-x64.zip' -Force
     Get-Item '../dist/Interval.exe' | Select-Object FullName,Length
 } finally { Pop-Location }
